@@ -1,700 +1,426 @@
-"""Exercise the common cpoutil against CPO platform hardware.
+"""Basic cpoutil hardware checks, following the scope of test_sfputil.py.
 
-See docs/testplan/cpoutil.md for requirements, dependencies and run options.
+Tests select their DUT explicitly and use connected CPO ports from the testbed
+connection graph. Commands and public output checks stay together. The DUT
+helper removes identity data before any command output reaches Ansible.
 """
 from contextlib import contextmanager
+import hashlib
 import json
 import logging
 import math
 from pathlib import Path
-import re
 import shlex
 
 import pytest
 
 from tests.common.utilities import wait_until
-from .argument_cases import ARGUMENT_CASES, HELP_COMMANDS, LEAF_COMMANDS
 
 
 logger = logging.getLogger(__name__)
-pytestmark = [pytest.mark.topology("any"), pytest.mark.device_type("physical")]
-
-INTERFACE_SHOW = ("map", "presence", "dom", "tx-disable", "speed application", "lane-status")
-ENDPOINT_SHOW = ("status", "temperature", "lpmode")
-COMMAND_ERROR_RC = 1
+pytestmark = [pytest.mark.topology("any"), pytest.mark.device_type("physical"),
+              pytest.mark.usefixtures("preserve_device_state")]
 
 
-def runner_request(dut, payload):
-    script = (Path(__file__).parent / "files" / "cpo_runner.py").read_text(encoding="utf-8")
-    command = "sudo python3 -c {} {}".format(shlex.quote(script), shlex.quote(json.dumps(payload)))
-    outer = dut.command(command, module_ignore_errors=True, verbose=False)
-    assert outer["rc"] == 0, "DUT runner failed; raw command output suppressed"
+def numbers(value):
+    return [int(item) for item in value] if isinstance(value, (list, tuple)) else [
+        int(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def read_port_config(duthost):
+    """Keep only test inputs; omit descriptions/aliases from assertion locals."""
+    result = duthost.command("sonic-cfggen -d --var-json PORT", verbose=False)
+    return {port: {key: value for key, value in entry.items() if key in ("lanes", "index", "dom_polling")}
+            for port, entry in json.loads(result["stdout"]).items()}
+
+
+def run_cpoutil(duthost, arguments, expected_rc=0, optional=False):
+    """Execute the visible command in one transport step; return safe output."""
+    script = (Path(__file__).parent / "files/cpo_runner.py").read_text(encoding="utf-8")
+    command = "sudo python3 -c {} {}".format(shlex.quote(script), shlex.quote(json.dumps(shlex.split(arguments))))
+    outer = duthost.command(command, module_ignore_errors=True, verbose=False)
+    assert outer["rc"] == 0, "DUT output helper failed; raw output suppressed"
     try:
-        return json.loads(outer["stdout"])
+        result = json.loads(outer["stdout"])
     except ValueError:
-        pytest.fail("DUT runner returned invalid JSON; raw command output suppressed")
-
-
-def run(dut, arguments, rc=0, privileged=True):
-    result = runner_request(dut, {"args": shlex.split(arguments), "privileged": privileged})
-    # The DUT runner projects/redacts identity data before it reaches Ansible.
-    logger.info("cpoutil %s: rc=%s", shlex.split(arguments)[:3], result.get("rc"))
-    if rc is not None:
-        assert result["rc"] == rc, "cpoutil returned {}, expected {}: {}".format(
-            result["rc"], rc, result.get("stderr", ""))
-    assert "traceback" not in result.get("stderr", "").lower(), "CLI traceback suppressed"
+        pytest.fail("DUT output helper returned invalid JSON; raw output suppressed")
+    logger.info("cpoutil %s: rc=%s", arguments, result["rc"])
+    if optional and result["rc"] == 1 and "not implemented" in result["stderr"]:
+        pytest.skip("Platform explicitly does not implement this operation")
+    if expected_rc is not None:
+        assert result["rc"] == expected_rc, "cpoutil returned {}, expected {}: {}".format(
+            result["rc"], expected_rc, result["stderr"])
+    assert "traceback" not in result["stderr"], "CLI traceback suppressed"
     return result
 
 
-def json_output(dut, arguments, optional=False):
-    result = run(dut, arguments + " --json", rc=None)
-    if optional and is_unsupported(result):
-        pytest.skip("{}: {}".format(arguments, result.get("stderr", "")))
-    assert result["rc"] == 0, result
-    records = json.loads(result["stdout"])
-    assert isinstance(records, dict) and records, result
-    return records
-
-
-def is_unsupported(result):
-    # Do not turn EEPROM failures, malformed JSON or missing APIs into a skip.
-    return result["rc"] == COMMAND_ERROR_RC and "not implemented" in result.get("stderr", "").lower()
-
-
-def integers(value):
-    if isinstance(value, (list, tuple)):
-        return [int(item) for item in value]
-    return [int(item.strip()) for item in str(value).split(",") if item.strip()]
-
-
-def expected_mapping(topology, ports):
-    """Build an oracle from ASIC lane ownership, without importing cpoutil.
-
-    The bank slice defines the full parent port. Active lanes select breakout
-    children. Empty precise laser maps must not imply sequential wiring.
-    """
-    devices = topology["devices"]
-    parents = []
-    for name, entry in topology["interfaces"].items():
-        associations = entry["associated_devices"]
-        oe = next(item for item in associations if devices[item["device_id"]]["device_type"] == "optical_engine")
-        els = next(item for item in associations
-                   if devices[item["device_id"]]["device_type"] == "external_laser_source")
-        device = devices[oe["device_id"]]
-        lanes = integers(device["asic_lanes"])
-        banks = int(device.get("max_banks", 1))
-        assert lanes and len(lanes) % banks == 0, device
-        width = len(lanes) // banks
-        bank = int(oe["bank"])
-        parent_lanes = lanes[bank * width:(bank + 1) * width]
-        parents.append((name, oe, els, parent_lanes))
-
-    expected = {}
-    for port, config in ports.items():
-        lanes = set(integers(config["lanes"]))
-        matches = [entry for entry in parents if lanes and lanes <= set(entry[3])]
-        assert len(matches) <= 1, "Ambiguous CPO lane ownership for {}".format(port)
-        if not matches:
-            continue
-        parent, oe, els, parent_lanes = matches[0]
-        els_device = devices[els["device_id"]]
-        precise = els_device.get("laser_to_asic_lane_mapping", {})
-        if precise:
-            lasers = sorted(int(laser) - 1 for laser, wired in precise.items() if lanes.intersection(integers(wired)))
-            covered = {lane for wired in precise.values() for lane in integers(wired)}
-            assert lanes <= covered, "Incomplete ELS laser wiring for {}".format(port)
-        elif lanes == set(parent_lanes):
-            lasers = topology.get("platform_data", {}).get("interfaces", {}).get(parent, {}).get("laser_ids", [])
-        else:
-            fallback = topology.get("platform_data", {}).get("interfaces", {}).get(parent, {}).get("laser_ids", [])
-            lasers = None if fallback else []
-        els_record = {"id": els["device_id"].upper(), "lasers": lasers}
-        if els.get("bank") not in (None, "N/A"):
-            els_record["bank"] = int(els["bank"])
-        expected[port] = {
-            "oe": {"id": oe["device_id"].upper(), "bank": int(oe["bank"]),
-                   "lanes": [lane for lane in parent_lanes if lane in lanes]},
-            "els": els_record,
-        }
-    return expected
-
-
-def probe(dut, ports):
-    indices = sorted({index for entry in ports.values() for index in integers(entry["index"])})
-    script = (Path(__file__).parent / "files" / "cpo_probe.py").read_text()
-    command = "sudo python3 -c {} {}".format(shlex.quote(script), shlex.quote(json.dumps(indices)))
-    result = dut.command(command, module_ignore_errors=True, verbose=False)
-    assert result["rc"] == 0, "Platform probe failed; raw output suppressed"
-    return json.loads(result["stdout"])
-
-
-def service_snapshot(dut):
-    # Avoid Docker Go templates: Ansible would parse their braces as Jinja.
-    container_ids = dut.command("docker ps -q", verbose=False)["stdout"].splitlines()
-    if not container_ids:
+def container_snapshot(duthost):
+    ids = duthost.command("docker ps -q", verbose=False)["stdout"].split()
+    if not ids:
         return {}
-    result = dut.command("docker inspect " + " ".join(shlex.quote(item) for item in container_ids), verbose=False)
+    result = duthost.command("docker inspect " + " ".join(shlex.quote(item) for item in ids), verbose=False)
     return {item["Name"]: (item["Id"], item["State"]["StartedAt"], item["RestartCount"])
             for item in json.loads(result["stdout"])}
 
 
 @pytest.fixture(scope="module")
-def cpo_environment(duthosts, enum_rand_one_per_hwsku_frontend_hostname):
-    dut = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
-    if int(dut.facts.get("num_asic", 1)) != 1:
-        pytest.skip("cpoutil currently loads the host PORT table; multi-ASIC namespace support is not covered")
-    platform = dut.facts["platform"]
-    path = "/usr/share/sonic/device/{}/cpo.json".format(platform)
-    if not dut.stat(path=path, verbose=False)["stat"]["exists"]:
-        pytest.skip("Platform has no cpo.json")
-    topology = json.loads(dut.command("cat " + shlex.quote(path), verbose=False)["stdout"])
-    ports = json.loads(dut.command("sonic-cfggen -d --var-json PORT", verbose=False)["stdout"])
-    mapping = expected_mapping(topology, ports)
-    assert mapping, "CPO topology did not resolve any active PORT entries"
-    run(dut, "--help")  # A missing CLI on a CPO image is a failure.
-    cpo_ports = {port: ports[port] for port in mapping}
-    objects = probe(dut, cpo_ports)
-    for port, config in cpo_ports.items():
-        indices = integers(config["index"])
-        if len(indices) != 1:
-            pytest.skip("Ganged CPO ports need member-aware assertions: {}".format(port))
-        assert objects[str(indices[0])] is not None, "Missing chassis CPO object for {}".format(port)
-    # Every active CPO interface is queried, including unconnected/absent ones.
-    logger.info("CPO ports: %s", sorted(mapping))
-    return {"dut": dut, "ports": ports, "mapping": mapping, "objects": objects, "topology": topology}
-
-
-@pytest.fixture(autouse=True)
-def preserve_state(cpo_environment):
-    dut = cpo_environment["dut"]
-    before_ports = json.loads(dut.command("sonic-cfggen -d --var-json PORT", verbose=False)["stdout"])
-    before_services = service_snapshot(dut)
+def preserve_device_state(duthosts, enum_rand_one_per_hwsku_frontend_hostname):
+    """Explicit module marker checks PORT/container state once around the suite."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    before_ports = hashlib.sha256(json.dumps(json.loads(duthost.command(
+        "sonic-cfggen -d --var-json PORT", verbose=False)["stdout"]), sort_keys=True).encode()).hexdigest()
+    containers = container_snapshot(duthost)
     yield
-    assert json.loads(dut.command("sonic-cfggen -d --var-json PORT", verbose=False)["stdout"]) == before_ports
-    assert service_snapshot(dut) == before_services, "Container identity/start time/restart count changed"
+    after_ports = hashlib.sha256(json.dumps(json.loads(duthost.command(
+        "sonic-cfggen -d --var-json PORT", verbose=False)["stdout"]), sort_keys=True).encode()).hexdigest()
+    assert after_ports == before_ports, "PORT configuration changed"
+    assert container_snapshot(duthost) == containers, "Container identity/start time/restart count changed"
 
 
-def resources(environment, target):
-    if target == "interface":
-        return sorted(environment["mapping"])
-    return sorted({entry[target]["id"].lower() for entry in environment["mapping"].values()})
+@pytest.fixture(scope="module")
+def connected_cpo_ports(duthosts, enum_rand_one_per_hwsku_frontend_hostname, conn_graph_facts):
+    """Return port names only; the fixture neither selects controls nor probes hardware."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    if int(duthost.facts.get("num_asic", 1)) != 1:
+        pytest.skip("This basic suite currently uses the single-ASIC host PORT table")
+    path = "/usr/share/sonic/device/{}/cpo.json".format(duthost.facts["platform"])
+    if not duthost.stat(path=path, verbose=False)["stat"]["exists"]:
+        pytest.skip("Platform has no cpo.json")
+    topology = json.loads(duthost.command("cat " + shlex.quote(path), verbose=False)["stdout"])
+    ports = read_port_config(duthost)
+    connections = conn_graph_facts.get("device_conn", {}).get(duthost.hostname, {})
+    oe_lanes = [set(numbers(device["asic_lanes"])) for device in topology["devices"].values()
+                if device["device_type"] == "optical_engine"]
+    selected = sorted(port for port in connections if port in ports and numbers(ports[port]["lanes"])
+                      and any(set(numbers(ports[port]["lanes"])) <= lanes for lanes in oe_lanes))
+    if not selected:
+        pytest.skip("Connection graph has no connected CPO ports")
+    if any(len(numbers(ports[port]["index"])) != 1 for port in selected):
+        pytest.skip("Ganged CPO ports require member-aware controls")
+    logger.info("Connected CPO ports selected from connection graph: %s", selected)
+    return selected
 
 
-def check_record(command, value, mapping=None):
-    if command == "presence":
-        assert isinstance(value["present"], bool), value
-        assert value["els"] == mapping["els"]["id"], value
-    elif command == "map":
-        assert value == mapping
-    elif command == "lpmode":
-        assert isinstance(value, bool), value
-    elif command == "temperature":
-        assert not isinstance(value, bool) and math.isfinite(float(value)), value
-    elif command == "status":
-        assert isinstance(value, str) and value and value != "N/A", value
-    elif command == "dom":
-        assert isinstance(value["present"], bool), value
-        for endpoint in ("oe", "els"):
-            if value["present"]:
-                for section in ("info", "dom", "thresholds"):
-                    assert isinstance(value[endpoint][section], dict), "DOM section must be a dictionary"
-                    if section != "thresholds":
-                        assert value[endpoint][section], "DOM info/monitor section must not be empty"
-            else:
-                assert value[endpoint] == {}, value
-        assert not value.get("read_errors"), value
-    elif command == "tx-disable":
-        assert len(value) == len(mapping["oe"]["lanes"]), value
-        assert all(isinstance(item, bool) for item in value.values()), value
-    elif command == "speed application":
-        assert isinstance(value["Application Advertisement"], dict) and value["Application Advertisement"], value
-        for section in ("Application Select Controls", "Active Application Control Set"):
-            assert len(value[section]) == len(mapping["oe"]["lanes"]), value
-    elif command == "lane-status":
-        assert len(value["Data Path State Indicator"]) == len(mapping["oe"]["lanes"]), value
-        assert value["ELS"] == mapping["els"]["id"], value
-        assert value["ELS Lasers"] == mapping["els"]["lasers"], value
-        assert isinstance(value["ELS Status"], dict) and value["ELS Status"], value
+def wait_for_state(duthost, command, expected, timeout=30):
+    """Poll one JSON query for a requested or restored state."""
+    def matches():
+        result = run_cpoutil(duthost, command + " --json", expected_rc=None)
+        return result["rc"] == 0 and json.loads(result["stdout"]) == expected
+    assert wait_until(timeout, 2, 0, matches), "CPO state did not converge: " + command
 
 
-@pytest.mark.parametrize("command", INTERFACE_SHOW)
-def test_interface_queries(cpo_environment, command):
-    """Validate every active interface in bulk JSON and individual JSON/table queries."""
-    env = cpo_environment
-    dut = env["dut"]
-    bulk = json_output(dut, "show interface " + command, optional=command == "tx-disable")
-    assert set(bulk) == set(env["mapping"]), bulk
-    table = run(dut, "show interface " + command)["stdout"]
-    for port, mapping in env["mapping"].items():
-        assert port in table
-        selected = json_output(dut, "show interface {} -p {}".format(command, port))
-        assert set(selected) == {port}, selected
-        check_record(command, bulk[port], mapping)
-        check_record(command, selected[port], mapping)
-        assert port in run(dut, "show interface {} --port {}".format(command, port))["stdout"]
-        if command in ("map", "presence"):
-            assert selected[port] == bulk[port]
-        if command == "presence":
-            index = integers(env["ports"][port]["index"])[0]
-            assert selected[port]["present"] == env["objects"][str(index)]["presence"]["value"]
-        elif command == "tx-disable":
-            index = integers(env["ports"][port]["index"])[0]
-            values = env["objects"][str(index)]["tx_disable"]["value"]
-            oe = env["topology"]["devices"][mapping["oe"]["id"]]
-            width = len(integers(oe["asic_lanes"])) // int(oe.get("max_banks", 1))
-            bank = mapping["oe"]["bank"]
-            parent_lanes = integers(oe["asic_lanes"])[bank * width:(bank + 1) * width]
-            if isinstance(values, dict):
-                values = [value for _, value in sorted(values.items(), key=lambda item: int(
-                    re.search(r"\d+$", str(item[0])).group()))]
-            expected = {"lane{:02d}".format(lane): values[lane] for lane, asic_lane in enumerate(parent_lanes)
-                        if asic_lane in mapping["oe"]["lanes"]}
-            assert selected[port] == expected
-
-
-@pytest.mark.parametrize("target", ("oe", "els"))
-@pytest.mark.parametrize("command", ENDPOINT_SHOW)
-def test_endpoint_queries(cpo_environment, target, command):
-    """Check de-duplicated OE/ELS inventory, single selectors and table/JSON output."""
-    dut = cpo_environment["dut"]
-    expected = resources(cpo_environment, target)
-    bulk = json_output(dut, "show {} {}".format(target, command), optional=command == "lpmode")
-    assert set(bulk) == set(expected), bulk
-    table = run(dut, "show {} {}".format(target, command))["stdout"].lower()
-    for name in expected:
-        assert name in table
-        single = json_output(dut, "show {} {} {}".format(target, command, name))
-        assert set(single) == {name}, single
-        check_record(command, bulk[name])
-        check_record(command, single[name])
-        assert name in run(dut, "show {} {} {}".format(target, command, name))["stdout"].lower()
-        if command == "lpmode":
-            port = next(port for port, entry in cpo_environment["mapping"].items()
-                        if entry[target]["id"].lower() == name)
-            index = integers(cpo_environment["ports"][port]["index"])[0]
-            assert single[name] == cpo_environment["objects"][str(index)][target + "_lpmode"]["value"]
-
-
-def eeprom_pages(environment, port, target):
-    index = integers(environment["ports"][port]["index"])[0]
-    return environment["objects"][str(index)][target + "_pages"]
-
-
-def eeprom_ranges(environment, port, target):
-    """Select valid ranges from the actual endpoint map, never assume an ELS page-zero alias."""
-    mapping = environment["mapping"][port]
-    pages = eeprom_pages(environment, port, target)
-    ranges = []
-    if any(page["page"] == 0 and page["lower"] for page in pages):
-        ranges.append((0, 0, 0))
-    if target == "oe" and any(page["page"] == 0x10 and not page["lower"] for page in pages):
-        ranges.append((mapping["oe"]["bank"], 0x10, 128))
-    else:
-        upper = sorted(page["page"] for page in pages if not page["lower"])
-        if upper:
-            bank = mapping["oe"]["bank"] if target == "oe" and upper[0] >= 0x10 else 0
-            ranges.append((bank, upper[0], 128))
-    assert ranges, "Endpoint map exposes no readable test range"
-    return ranges
-
-
-@pytest.mark.parametrize("target", ("oe", "els"))
-@pytest.mark.parametrize("syntax", ("short-decimal", "long-hex"))
-def test_eeprom_reads(cpo_environment, target, syntax):
-    """Compare declared ranges through endpoint/interface paths without returning their bytes."""
-    dut = cpo_environment["dut"]
-    for port, mapping in cpo_environment["mapping"].items():
-        name = mapping[target]["id"]
-        for bank, page, offset in eeprom_ranges(cpo_environment, port, target):
-            args = "-n {} -o {} -s 4".format(page, offset) if syntax == "short-decimal" else (
-                "--page {} --offset {} --size 4".format(hex(page), hex(offset)))
-            direct = run(dut, "read-eeprom {} --index {} --bank {} {}".format(
-                target, int(name[len(target):]), bank, args))
-            indirect = run(dut, "read-eeprom interface -p {} --{} {}".format(port, target, args))
-            assert direct["eeprom"]["size"] == indirect["eeprom"]["size"] == 4
-            assert direct["eeprom"]["sha256"] == indirect["eeprom"]["sha256"], "EEPROM paths disagree"
-
-
-@pytest.mark.parametrize("target", ("oe", "els", "all"))
-def test_eeprom_full_dump(cpo_environment, target):
-    """Full dumps include every unique endpoint, not one duplicate per interface."""
-    result = run(cpo_environment["dut"], "read-eeprom" + (" " + target if target != "all" else ""))
-    expected = resources(cpo_environment, target) if target != "all" else (
-        resources(cpo_environment, "oe") + resources(cpo_environment, "els"))
-    names = [heading.removeprefix("EEPROM hexdump for ").lower() for heading in result["eeprom"]["headings"]]
-    assert sorted(names) == sorted(expected), "EEPROM dump inventory mismatch"
-    assert result["eeprom"]["size"] > 0
-
-
-@pytest.mark.parametrize("target", ("oe", "els"))
-@pytest.mark.parametrize("access", ("endpoint", "interface"))
-def test_selected_eeprom_full_dump(cpo_environment, target, access):
-    """Omitting all three range fields is a valid single-resource/interface full dump."""
-    env = cpo_environment
-    port = resources(env, "interface")[0]
-    name = env["mapping"][port][target]["id"]
-    arguments = "read-eeprom {} -i {}".format(target, int(name[len(target):])) if access == "endpoint" else (
-        "read-eeprom interface --port {} --{}".format(port, target))
-    result = run(env["dut"], arguments)
-    assert result["eeprom"]["size"] > 0
-    assert len(result["eeprom"]["headings"]) == 1
-    expected = name if access == "endpoint" else "port {} ({})".format(port, name)
-    assert result["eeprom"]["headings"][0] == "EEPROM hexdump for " + expected
-
-
-@pytest.mark.parametrize("case", ARGUMENT_CASES, ids=lambda case: case[0])
-def test_argument_matrix(cpo_environment, case):
-    """Exercise missing fields, bad values and invalid combinations across every leaf command."""
-    _, arguments, diagnostic, _, expected_rc = case
-    values = {"port": resources(cpo_environment, "interface")[0],
-              "oe": int(resources(cpo_environment, "oe")[0][2:]),
-              "els": int(resources(cpo_environment, "els")[0][3:])}
-    result = run(cpo_environment["dut"], arguments.format(**values), rc=expected_rc)
-    assert diagnostic in result["stderr"], "Incorrect argument-error category"
-
-
-@pytest.mark.parametrize("command", HELP_COMMANDS, ids=lambda command: command or "root")
-def test_command_help(cpo_environment, command):
-    """Every group and leaf publishes help without changing hardware."""
-    assert "Usage:" in run(cpo_environment["dut"], (command + " --help").strip())["stdout"]
-
-
-FAULT_CASES = tuple(("read-eeprom", target, failure) for target in (
-    "oe", "els", "interface-oe", "interface-els") for failure in (
-        "none", "short", "oserror", "timeout", "unsupported", "attribute")) + tuple(
-    ("write-eeprom", target, failure) for target in ("oe", "els", "interface-oe", "interface-els")
-    for failure in ("false", "oserror", "timeout", "unsupported", "attribute")) + tuple(
-    (operation, target, failure) for operation, target in (
-        ("tx-disable", "interface"), ("lpmode", "oe"), ("reset", "oe"), ("lpmode", "els"), ("reset", "els"))
-    for failure in ("false", "oserror", "timeout", "unsupported")) + (("tx-disable", "interface", "partial"),)
-
-
-@pytest.mark.parametrize("case", FAULT_CASES, ids=lambda case: "-".join(case))
-def test_simulated_io_failures(cpo_environment, case):
-    """Installed CLI reports synthetic failures without a real platform/EEPROM write."""
-    operation, target, failure = case
-    script = (Path(__file__).parent / "files" / "cpo_faults.py").read_text(encoding="utf-8")
-    payload = {"operation": operation, "target": target, "failure": failure}
-    command = "sudo python3 -c {} {}".format(shlex.quote(script), shlex.quote(json.dumps(payload)))
-    outer = cpo_environment["dut"].command(command, module_ignore_errors=True, verbose=False)
-    assert outer["rc"] == 0, "Synthetic-fault helper failed; raw output suppressed"
-    result = json.loads(outer["stdout"])
-    assert result["rc"] == COMMAND_ERROR_RC and not result["traceback"], "Fault escaped CLI error handling"
-    if operation == "read-eeprom":
-        assert result["reads"] == 1 and result["writes"] == result["controls"] == 0
-    elif operation == "write-eeprom":
-        assert result["writes"] == 1 and result["reads"] == result["controls"] == 0
-    else:
-        assert result["controls"] == (2 if failure == "partial" else 1)
-        assert result["reads"] == result["writes"] == 0
-    assert result["unsupported"] if failure == "unsupported" and operation not in (
-        "read-eeprom", "write-eeprom") else result["failed"]
-    if failure == "partial":
-        assert result["partial"], "Partial completion was not identified"
-
-
-@pytest.mark.parametrize("arguments,diagnostic,expected_rc", (
-    ("show oe temperature -1", "-1", 2), ("show els temperature -1", "-1", 2),
-    ("read-eeprom oe -i {oe} -b 1 -n 0 -o 0 -s 1", "does not use bank selection", 1),
-    ("show oe input-power", "no such command", 2), ("show els output-power", "no such command", 2),
-    ("show els presence", "no such command", 2),
-    ("config oe tx-disable 0 true", "no such command", 2), ("config els tx-disable 0 true", "no such command", 2),
-    ("show interface lpmode", "no such command", 2),
-    ("config interface lpmode -p __invalid_cpo_port__ low", "no such command", 2),
-    ("config interface reset -p __invalid_cpo_port__", "no such command", 2),
-))
-def test_invalid_arguments(cpo_environment, arguments, diagnostic, expected_rc):
-    """Rejected inputs and removed commands must return the CLI's documented error code."""
-    arguments = arguments.format(oe=int(resources(cpo_environment, "oe")[0][2:]),
-                                 els=int(resources(cpo_environment, "els")[0][3:]))
-    result = run(cpo_environment["dut"], arguments, rc=expected_rc)
-    assert diagnostic in result.get("stderr", "").lower(), result
-
-
-@pytest.mark.parametrize("target", ("oe", "els"))
-@pytest.mark.parametrize("operation", ("read-eeprom", "write-eeprom"))
-def test_undeclared_eeprom_page(cpo_environment, target, operation):
-    """Both read and write reject an address outside the endpoint's memory map."""
-    env = cpo_environment
-    selector = resources(env, target)[0]
-    port = next(port for port, entry in env["mapping"].items() if entry[target]["id"].lower() == selector)
-    declared = {page["page"] for page in eeprom_pages(env, port, target)}
-    page = next((page for page in range(255, -1, -1) if page not in declared), None)
-    if page is None:
-        pytest.skip("Endpoint declares every possible page")
-    args = "{} {} -i {} -n {} -o 128 ".format(operation, target, int(selector[len(target):]), page)
-    result = run(env["dut"], args + ("-s 1" if operation == "read-eeprom" else "-d ff"), rc=COMMAND_ERROR_RC)
-    assert "not declared" in result["stderr"], "Undeclared page must be rejected before hardware access"
-
-
-@pytest.mark.parametrize("arguments,expected_rc", (("--help", 0),) + tuple(
-    (command, 1) for command in LEAF_COMMANDS + ("read-eeprom",)))
-def test_root_privileges(cpo_environment, arguments, expected_rc):
-    """Top-level help is public; hardware commands reject an unprivileged user."""
-    result = run(cpo_environment["dut"], arguments, rc=expected_rc, privileged=False)
-    if expected_rc:
-        assert "root privileges are required" in result["stderr"]
-    else:
-        assert "Usage:" in result["stdout"]
-
-
-def test_sfp_coexistence(cpo_environment):
-    """Ordinary SFP ports are absent from CPO output and are directed to sfputil."""
-    dut = cpo_environment["dut"]
-    ordinary = set(cpo_environment["ports"]) - set(cpo_environment["mapping"])
-    if not ordinary:
-        pytest.skip("No ordinary SFP ports on this DUT")
-    for port in sorted(ordinary):
-        result = run(dut, "show interface presence -p " + port, rc=COMMAND_ERROR_RC)
-        assert "sfputil" in result["stderr"], result
-
-
-@pytest.mark.parametrize("query", ("interface map", "oe temperature"))
-def test_concurrent_queries(cpo_environment, query):
-    """Independent read processes return complete, parseable mapping output."""
-    dut = cpo_environment["dut"]
-    # One transport call avoids concurrent use of an Ansible host object; each
-    # CLI process still passes through DUT-side output projection.
-    result = runner_request(dut, {"concurrent": ["show"] + query.split() + ["--json"]})
-    assert len(result["jobs"]) == 4
-    for item in result["jobs"]:
-        assert item["rc"] == 0, item
-        records = json.loads(item["stdout"])
-        if query == "interface map":
-            assert records == cpo_environment["mapping"]
-        else:
-            assert set(records) == set(resources(cpo_environment, "oe")), records
-            for value in records.values():
-                check_record("temperature", value)
-
-
-def affected_ports(environment, target, selector, command):
-    mapping = environment["mapping"]
-    if target != "interface":
-        return sorted(port for port, entry in mapping.items() if entry[target]["id"].lower() == selector)
-    assert command == "tx-disable", "Only Tx-disable is available at interface scope"
-    indices = set(integers(environment["ports"][selector]["index"]))
-    return sorted(port for port in mapping
-                  if indices.intersection(integers(environment["ports"][port]["index"])))
-
-
-def interfaces_up(dut, ports):
-    status = dut.show_interface(command="status")["ansible_facts"]["int_status"]
-    return all(status[port]["oper_state"] == "up" for port in ports)
+def interfaces_have_state(duthost, ports, state):
+    status = duthost.show_interface(command="status")["ansible_facts"]["int_status"]
+    return all(status[port]["oper_state"] == state for port in ports)
 
 
 @contextmanager
-def isolated_ports(environment, ports):
-    """Quiesce every shared port and restore admin/DOM settings even on failure."""
-    dut = environment["dut"]
-    baseline = dut.show_interface(command="status")["ansible_facts"]["int_status"]
-    config = json.loads(dut.command("sonic-cfggen -d --var-json PORT", verbose=False)["stdout"])
+def isolated_interfaces(duthost, ports):
+    """Quiesce shared ports, then restore DOM/admin settings and original up links."""
+    baseline = duthost.show_interface(command="status")["ansible_facts"]["int_status"]
+    config = read_port_config(duthost)
     originally_up = [port for port in ports if baseline[port]["oper_state"] == "up"]
-    restore_errors = []
+    errors = []
     try:
         for port in ports:
-            result = dut.command("sudo config interface transceiver dom {} disable".format(port),
-                                 module_ignore_errors=True)
-            assert result["rc"] == 0, result
-            result = dut.command("sudo config interface shutdown " + port, module_ignore_errors=True)
-            assert result["rc"] == 0, result
-        assert wait_until(60, 2, 0, lambda: all(
-            dut.show_interface(command="status")["ansible_facts"]["int_status"][port]["oper_state"] == "down"
-            for port in ports)), "Shared interfaces did not shut down"
+            result = duthost.command("sudo config interface transceiver dom {} disable".format(port),
+                                     module_ignore_errors=True, verbose=False)
+            assert result["rc"] == 0, "Could not disable DOM polling"
+            result = duthost.command("sudo config interface shutdown " + port,
+                                     module_ignore_errors=True, verbose=False)
+            assert result["rc"] == 0, "Could not shut down shared port"
+        assert wait_until(60, 2, 0, interfaces_have_state, duthost, ports, "down")
         yield
     finally:
-        # Attempt every restoration, collecting failures rather than stopping at the first.
         for port in ports:
-            mode = "startup" if baseline[port]["admin_state"] == "up" else "shutdown"
-            commands = ["sudo config interface {} {}".format(mode, port)]
             key = shlex.quote("PORT|" + port)
-            if "dom_polling" in config[port]:
-                commands.append("sonic-db-cli CONFIG_DB HSET {} dom_polling {}".format(
-                    key, shlex.quote(config[port]["dom_polling"])))
-            else:
-                commands.append("sonic-db-cli CONFIG_DB HDEL {} dom_polling".format(key))
-            for command in commands:
+            dom = "sonic-db-cli CONFIG_DB HSET {} dom_polling {}".format(
+                key, shlex.quote(config[port]["dom_polling"])) if "dom_polling" in config[port] else (
+                    "sonic-db-cli CONFIG_DB HDEL {} dom_polling".format(key))
+            mode = "startup" if baseline[port]["admin_state"] == "up" else "shutdown"
+            for command in (dom, "sudo config interface {} {}".format(mode, port)):
                 try:
-                    result = dut.command(command, module_ignore_errors=True)
-                    if result["rc"] != 0:
-                        restore_errors.append(result)
-                except Exception as exc:
-                    restore_errors.append(str(exc))
-        assert not restore_errors, "Interface restoration failed: {}".format(restore_errors)
-        assert wait_until(180, 5, 0, interfaces_up, dut, originally_up), "Original links did not recover"
+                    if duthost.command(command, module_ignore_errors=True, verbose=False)["rc"] != 0:
+                        errors.append(port)
+                except Exception:
+                    errors.append(port)
+        assert not errors, "Shared interface restoration failed for: {}".format(sorted(set(errors)))
+        assert wait_until(180, 5, 0, interfaces_have_state, duthost, originally_up, "up"), \
+            "Original links did not recover"
 
 
-def matches_json(dut, arguments, expected):
-    result = run(dut, arguments + " --json", rc=None)
-    return result["rc"] == 0 and json.loads(result["stdout"]) == expected
+def test_cpoutil_map(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports):
+    """Check public mapping fields against PORT lanes and the configured topology."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    ports = read_port_config(duthost)
+    path = "/usr/share/sonic/device/{}/cpo.json".format(duthost.facts["platform"])
+    topology = json.loads(duthost.command("cat " + shlex.quote(path), verbose=False)["stdout"])
+    devices = {name.upper(): device for name, device in topology["devices"].items()}
+    records = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
+    for port in connected_cpo_ports:
+        oe, els = records[port]["oe"], records[port]["els"]
+        assert devices[oe["id"]]["device_type"] == "optical_engine"
+        assert devices[els["id"]]["device_type"] == "external_laser_source"
+        assert set(oe["lanes"]) == set(numbers(ports[port]["lanes"]))
+        assert type(oe["bank"]) is int and 0 <= oe["bank"] < int(devices[oe["id"]].get("max_banks", 1))
+        assert set(oe["lanes"]) <= set(numbers(devices[oe["id"]]["asic_lanes"]))
+        width = len(numbers(devices[oe["id"]]["asic_lanes"])) // int(devices[oe["id"]].get("max_banks", 1))
+        bank_lanes = numbers(devices[oe["id"]]["asic_lanes"])[oe["bank"] * width:(oe["bank"] + 1) * width]
+        assert set(oe["lanes"]) <= set(bank_lanes), "Interface lanes do not belong to the declared OE bank"
+        assert any(
+            any(item["device_id"].upper() == oe["id"] and int(item.get("bank", 0)) == oe["bank"]
+                for item in entry["associated_devices"])
+            and any(item["device_id"].upper() == els["id"] for item in entry["associated_devices"])
+            for entry in topology["interfaces"].values()), "OE/ELS association does not match topology"
+        assert els["lasers"] is None or (isinstance(els["lasers"], list)
+                                         and all(type(laser) is int and laser >= 0 for laser in els["lasers"]))
+    table = run_cpoutil(duthost, "show interface map")["table"]
+    assert {"Interface", "OE", "OE Lanes", "ELS", "ELS Lasers"} <= set(table["headers"])
+    assert set(connected_cpo_ports) <= set(table["resources"])
+    port = connected_cpo_ports[0]
+    assert json.loads(run_cpoutil(duthost, "show interface map -p " + port + " --json")["stdout"]) == {
+        port: records[port]}
+
+
+def test_cpoutil_presence(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports):
+    """Connected CPO interfaces are present and identify their mapped ELS."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    mapping = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
+    records = json.loads(run_cpoutil(duthost, "show interface presence --json")["stdout"])
+    for port in connected_cpo_ports:
+        assert records[port]["present"] is True, "Connected CPO port is absent: " + port
+        assert records[port]["els"] == mapping[port]["els"]["id"]
+    table = run_cpoutil(duthost, "show interface presence")["table"]
+    assert {"Interface", "ELS", "Presence"} <= set(table["headers"])
+    assert set(connected_cpo_ports) <= set(table["resources"])
+    port = connected_cpo_ports[0]
+    assert json.loads(run_cpoutil(duthost, "show interface presence -p " + port + " --json")["stdout"]) == {
+        port: records[port]}
+
+
+def test_cpoutil_dom(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports):
+    """Check DOM structure and read status without asserting identity values."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    records = json.loads(run_cpoutil(duthost, "show interface dom --json")["stdout"])
+    for port in connected_cpo_ports:
+        record = records[port]
+        assert record["present"] is True
+        assert not record.get("read_errors"), "DOM read failed for " + port
+        for endpoint in ("oe", "els"):
+            for section in ("info", "dom", "thresholds"):
+                assert isinstance(record[endpoint][section], dict)
+                if section != "thresholds":
+                    assert record[endpoint][section], "DOM section is empty: " + section
+    port = connected_cpo_ports[0]
+    table = run_cpoutil(duthost, "show interface dom -p " + port)["dom"]
+    assert table[port]["present"] is True
+    assert set(table[port]["sections"]) == {"oe", "els"}
 
 
 @pytest.mark.parametrize("target", ("oe", "els"))
-def test_low_power_control(cpo_environment, request, target):
-    """Toggle one controller/endpoint, check readback and restore its original state."""
-    if not request.config.getoption("--cpo-disruptive"):
-        pytest.skip("Use --cpo-disruptive to test shared hardware controls")
-    env = cpo_environment
-    dut = env["dut"]
-    selector = resources(env, target)[0]
-    query = "show {} lpmode {}".format(target, selector)
-    original = json_output(dut, query, optional=True)
-    old = original[selector]
-    assert isinstance(old, bool), original
-    if old:
-        pytest.skip("Reprovisioning can clear an initial low-power state; use an initially full-power controller")
-    command = "config {} lpmode {} ".format(target, selector)
-    with isolated_ports(env, affected_ports(env, target, selector, "lpmode")):
-        attempted = False
-        unsupported = False
-        try:
-            attempted = True
-            result = run(dut, command + ("full" if old else "low"), rc=None)
-            unsupported = is_unsupported(result)
-            if unsupported:
-                assert json_output(dut, query) == original, "Unsupported setter changed state"
+def test_cpoutil_endpoint_status(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports, target):
+    """Read basic module state, temperature and low-power mode for OE or ELS."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    mapping = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
+    expected = {mapping[port][target]["id"].lower() for port in connected_cpo_ports}
+    queries = (("status", "Module State"), ("temperature", "Temperature (C)"), ("lpmode", "Low-power Mode"))
+    for command, heading in queries:
+        query = "show {} {}".format(target, command)
+        records = json.loads(run_cpoutil(duthost, query + " --json", optional=command == "lpmode")["stdout"])
+        assert expected <= set(records)
+        for name in expected:
+            value = records[name]
+            if command == "status":
+                assert isinstance(value, str) and value and value != "N/A"
+            elif command == "temperature":
+                assert not isinstance(value, bool) and math.isfinite(float(value))
             else:
-                assert result["rc"] == 0, result
-                assert wait_until(30, 2, 0, matches_json, dut, query, {selector: not old}), result
+                assert isinstance(value, bool)
+        table = run_cpoutil(duthost, query)["table"]
+        assert {target.upper(), heading} <= set(table["headers"])
+        assert {name.upper() for name in expected} <= set(table["resources"])
+        name = sorted(expected)[0]
+        assert json.loads(run_cpoutil(duthost, query + " " + name + " --json")["stdout"]) == {name: records[name]}
+
+
+def test_cpoutil_application(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports):
+    """Check public Host/Media application fields and per-interface lane counts."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    ports = read_port_config(duthost)
+    records = json.loads(run_cpoutil(duthost, "show interface speed application --json", optional=True)["stdout"])
+    for port in connected_cpo_ports:
+        advertisements = records[port]["Application Advertisement"]
+        assert isinstance(advertisements, dict) and advertisements
+        for application in advertisements.values():
+            assert isinstance(application, dict)
+            assert {"host_electrical_interface_id", "module_media_interface_id"} <= set(application)
+        for field in ("Application Select Controls", "Active Application Control Set"):
+            assert isinstance(records[port][field], dict)
+            assert len(records[port][field]) == len(numbers(ports[port]["lanes"]))
+    table = run_cpoutil(duthost, "show interface speed application")["table"]
+    assert {"Interface", "Lane", "Configured Application", "Active Application"} <= set(table["headers"])
+    assert set(connected_cpo_ports) <= set(table["resources"])
+
+
+def test_cpoutil_tx_disable_query(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports):
+    """Check boolean Tx flags and the common lane table for connected ports."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    ports = read_port_config(duthost)
+    records = json.loads(run_cpoutil(duthost, "show interface tx-disable --json", optional=True)["stdout"])
+    for port in connected_cpo_ports:
+        assert isinstance(records[port], dict) and len(records[port]) == len(numbers(ports[port]["lanes"]))
+        assert all(isinstance(value, bool) for value in records[port].values())
+    table = run_cpoutil(duthost, "show interface tx-disable")["table"]
+    assert {"Interface", "Lane", "Tx Disable Status"} <= set(table["headers"])
+    assert set(connected_cpo_ports) <= set(table["resources"])
+
+
+@pytest.mark.parametrize("target", ("oe", "els"))
+def test_cpoutil_eeprom_read(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports, target):
+    """Read one selected endpoint and its interface alias; transport no raw bytes."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    port = connected_cpo_ports[0]
+    mapping = json.loads(run_cpoutil(duthost, "show interface map -p " + port + " --json")["stdout"])[port]
+    name = mapping[target]["id"]
+    direct = run_cpoutil(duthost, "read-eeprom {} -i {}".format(target, int(name[len(target):])))["eeprom"]
+    assert direct["headings"] == ["EEPROM hexdump for " + name]
+    assert direct["size"] > 0
+    indirect = run_cpoutil(duthost, "read-eeprom interface -p {} --{}".format(port, target))["eeprom"]
+    assert indirect["headings"] == ["EEPROM hexdump for port {} ({})".format(port, name)]
+    assert indirect["size"] > 0
+
+
+def test_cpoutil_basic_arguments(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports):
+    """Small CLI smoke check; exhaustive parser/fault matrices are outside this suite."""
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    help_text = run_cpoutil(duthost, "--help")["stdout"]
+    assert "Usage:" in help_text and "Commands:" in help_text
+    assert all(command in help_text for command in ("show", "config", "read-eeprom", "write-eeprom"))
+    mapping = json.loads(run_cpoutil(duthost, "show interface map -p " + connected_cpo_ports[0] + " --json")["stdout"])
+    index = int(mapping[connected_cpo_ports[0]]["oe"]["id"][2:])
+    for options in ("--page 0", "--offset 0", "--page 0 --offset 0"):
+        result = run_cpoutil(duthost, "read-eeprom oe -i {} {}".format(index, options), expected_rc=1)
+        assert "must be supplied together" in result["stderr"]
+    result = run_cpoutil(duthost, "read-eeprom oe -i {} --page".format(index), expected_rc=2)
+    assert "requires an argument" in result["stderr"]
+
+
+@pytest.mark.parametrize("target", ("oe", "els"))
+def test_cpoutil_low_power(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports, request, target):
+    """Toggle one OE/ELS, verify readback and restore the original power mode."""
+    if not request.config.getoption("--cpo-disruptive"):
+        pytest.skip("Use --cpo-disruptive for hardware controls")
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    mapping = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
+    name = mapping[connected_cpo_ports[0]][target]["id"].lower()
+    affected = sorted(port for port, entry in mapping.items() if entry[target]["id"].lower() == name)
+    query = "show {} lpmode {}".format(target, name)
+    original = json.loads(run_cpoutil(duthost, query + " --json", optional=True)["stdout"])
+    assert isinstance(original[name], bool)
+    if original[name]:
+        pytest.skip("Restoration requires an initially full-power endpoint")
+    unsupported = False
+    with isolated_interfaces(duthost, affected):
+        try:
+            result = run_cpoutil(duthost, "config {} lpmode {} low".format(target, name), expected_rc=None)
+            unsupported = result["rc"] == 1 and "not implemented" in result["stderr"]
+            if unsupported:
+                wait_for_state(duthost, query, original)
+            else:
+                assert result["rc"] == 0, result["stderr"]
+                wait_for_state(duthost, query, {name: True})
         finally:
-            if attempted and not unsupported:
-                run(dut, command + ("low" if old else "full"))
-                assert wait_until(30, 2, 0, matches_json, dut, query, original), "Low-power restore failed"
+            if not unsupported:
+                run_cpoutil(duthost, "config {} lpmode {} full".format(target, name))
+                wait_for_state(duthost, query, original)
         if unsupported:
             pytest.skip("Platform explicitly does not implement the low-power setter")
-    assert wait_until(30, 2, 0, matches_json, dut, query, original), "Power mode changed during reprovisioning"
+    wait_for_state(duthost, query, original)
 
 
-def test_tx_disable_control(cpo_environment, request):
-    """Toggle a uniformly configured physical port and restore its original Tx state."""
+def test_cpoutil_tx_disable(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports, request):
+    """Toggle a physical port and restore TX for all of its mapped logical ports."""
     if not request.config.getoption("--cpo-disruptive"):
-        pytest.skip("Use --cpo-disruptive to test Tx-disable")
-    env = cpo_environment
-    dut = env["dut"]
-    port = resources(env, "interface")[0]
-    query = "show interface tx-disable -p " + port
-    original = json_output(dut, query, optional=True)
-    # The setter acts on the whole physical port. Include every breakout sibling.
-    affected = affected_ports(env, "interface", port, "tx-disable")
-    originals = {name: json_output(dut, "show interface tx-disable -p " + name) for name in affected}
-    states = {value for record in originals.values() for lanes in record.values() for value in lanes.values()}
-    if len(states) != 1 or not all(isinstance(value, bool) for value in states):
-        pytest.skip("Whole-port Tx setter cannot restore a mixed per-lane state")
-    old = states.pop()
-    if old:
-        pytest.skip("Reprovisioning can enable TX; use an initially enabled physical port")
-    command = "config interface tx-disable -p {} ".format(port)
-    with isolated_ports(env, affected):
-        unsupported = False
+        pytest.skip("Use --cpo-disruptive for hardware controls")
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    port = connected_cpo_ports[0]
+    config = read_port_config(duthost)
+    mapping = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
+    affected = sorted(name for name in mapping
+                      if set(numbers(config[name]["index"])) & set(numbers(config[port]["index"])))
+    originals = {}
+    for name in affected:
+        result = run_cpoutil(duthost, "show interface tx-disable -p " + name + " --json", optional=True)
+        originals[name] = json.loads(result["stdout"])
+    states = [value for name in affected for value in originals[name][name].values()]
+    if not states or any(value is not False for value in states):
+        pytest.skip("Restoration requires uniformly enabled TX on all physical-port lanes")
+    unsupported = False
+    with isolated_interfaces(duthost, affected):
         try:
-            result = run(dut, command + str(not old).lower(), rc=None)
-            unsupported = is_unsupported(result)
-            if unsupported:
-                assert json_output(dut, query) == original
-            else:
-                assert result["rc"] == 0, result
-                for name, record in originals.items():
-                    expected = {name: {lane: not old for lane in record[name]}}
-                    assert wait_until(30, 2, 0, matches_json, dut, "show interface tx-disable -p " + name, expected)
+            result = run_cpoutil(duthost, "config interface tx-disable -p " + port + " true", expected_rc=None)
+            unsupported = result["rc"] == 1 and "not implemented" in result["stderr"]
+            for name in affected:
+                expected = originals[name] if unsupported else {name: {lane: True for lane in originals[name][name]}}
+                if not unsupported:
+                    assert result["rc"] == 0, result["stderr"]
+                wait_for_state(duthost, "show interface tx-disable -p " + name, expected)
         finally:
             if not unsupported:
-                run(dut, command + str(old).lower())
-                for name, record in originals.items():
-                    assert wait_until(30, 2, 0, matches_json, dut, "show interface tx-disable -p " + name, record)
+                run_cpoutil(duthost, "config interface tx-disable -p " + port + " false")
+                for name in affected:
+                    wait_for_state(duthost, "show interface tx-disable -p " + name, originals[name])
         if unsupported:
             pytest.skip("Platform explicitly does not implement Tx-disable")
-    for name, record in originals.items():
-        assert wait_until(30, 2, 0, matches_json, dut, "show interface tx-disable -p " + name, record), \
-            "Tx-disable state changed during reprovisioning"
+    for name in affected:
+        wait_for_state(duthost, "show interface tx-disable -p " + name, originals[name])
 
 
 @pytest.mark.parametrize("target", ("oe", "els"))
-def test_reset_control(cpo_environment, request, target):
-    """Reset one shared controller, restore power mode, admin-toggle and recover original links."""
+def test_cpoutil_reset(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connected_cpo_ports, request, target):
+    """Reset one shared OE/ELS and check power, presence, Application and TX recovery."""
     if not request.config.getoption("--cpo-disruptive"):
-        pytest.skip("Use --cpo-disruptive to test reset")
-    env = cpo_environment
-    dut = env["dut"]
-    selector = resources(env, target)[0]
-    query = "show {} lpmode {}".format(target, selector)
-    original = json_output(dut, query, optional=True)
-    affected = affected_ports(env, target, selector, "reset")
-    if original[selector]:
-        pytest.skip("Reset recovery requires an initially full-power controller")
-    status = dut.show_interface(command="status")["ansible_facts"]["int_status"]
+        pytest.skip("Use --cpo-disruptive for hardware controls")
+    duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+    mapping = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
+    name = mapping[connected_cpo_ports[0]][target]["id"].lower()
+    affected = sorted(port for port, entry in mapping.items() if entry[target]["id"].lower() == name)
+    query = "show {} lpmode {}".format(target, name)
+    original = json.loads(run_cpoutil(duthost, query + " --json", optional=True)["stdout"])
+    if original[name] is not False:
+        pytest.skip("Reset recovery requires an initially full-power endpoint")
+    status = duthost.show_interface(command="status")["ansible_facts"]["int_status"]
     if any(status[port]["admin_state"] != "up" for port in affected):
-        pytest.skip("Reset recovery requires all affected ports admin-up for xcvrd reprovisioning")
-    before = {port: {command: json_output(
-                        dut, "show interface {} -p {}".format(command, port), optional=command == "tx-disable")
-                     for command in ("speed application", "tx-disable")} for port in affected}
-    with isolated_ports(env, affected):
-        unsupported = False
+        pytest.skip("Reset recovery requires all shared ports admin-up for reprovisioning")
+    before_presence = json.loads(run_cpoutil(duthost, "show interface presence --json")["stdout"])
+    before = {}
+    for port in affected:
+        before[port] = {}
+        for command in ("speed application", "tx-disable"):
+            result = run_cpoutil(duthost, "show interface {} -p {} --json".format(command, port), optional=True)
+            before[port][command] = json.loads(result["stdout"])
+    unsupported = False
+    with isolated_interfaces(duthost, affected):
         try:
-            result = run(dut, "config {} reset {}".format(target, selector), rc=None)
-            unsupported = is_unsupported(result)
-            if unsupported:
-                assert json_output(dut, query) == original, "Unsupported reset changed power mode"
-            else:
-                assert result["rc"] == 0, result
+            result = run_cpoutil(duthost, "config {} reset {}".format(target, name), expected_rc=None)
+            unsupported = result["rc"] == 1 and "not implemented" in result["stderr"]
+            assert unsupported or result["rc"] == 0, result["stderr"]
         finally:
             if not unsupported:
-                # Successful reset may reset CMIS state even if the command later fails.
-                assert wait_until(60, 2, 0, lambda: run(dut, query, rc=None)["rc"] == 0)
-                mode = "low" if original[selector] else "full"
-                run(dut, "config {} lpmode {} {}".format(target, selector, mode))
-                assert wait_until(30, 2, 0, matches_json, dut, query, original)
+                assert wait_until(60, 2, 0, lambda: run_cpoutil(
+                    duthost, query + " --json", expected_rc=None)["rc"] == 0)
+                run_cpoutil(duthost, "config {} lpmode {} full".format(target, name))
+                wait_for_state(duthost, query, original)
         if unsupported:
             pytest.skip("Platform explicitly does not implement reset")
-    presence = json_output(dut, "show interface presence")
-    assert wait_until(30, 2, 0, matches_json, dut, query, original), "Reset power mode did not recover"
+    wait_for_state(duthost, query, original)
+    presence = json.loads(run_cpoutil(duthost, "show interface presence --json")["stdout"])
     for port in affected:
-        index = integers(env["ports"][port]["index"])[0]
-        assert presence[port]["present"] == env["objects"][str(index)]["presence"]["value"]
-        for command, record in before[port].items():
-            assert wait_until(60, 2, 0, matches_json, dut, "show interface {} -p {}".format(command, port), record), \
-                "Reset did not restore {} for {}".format(command, port)
+        assert presence[port] == before_presence[port]
+        for command in before[port]:
+            wait_for_state(duthost, "show interface {} -p {}".format(command, port), before[port][command], timeout=60)
 
 
-@pytest.mark.parametrize("access", ("endpoint", "interface"))
-def test_eeprom_write(cpo_environment, request, access):
-    """Write an approved scratch range, verify it, and restore the saved bytes in finally."""
-    location = request.config.getoption("--cpo-eeprom-write")
-    if not location:
-        pytest.skip("Supply --cpo-eeprom-write with a platform-approved scratch range")
-    assert request.config.getoption("--cpo-disruptive"), "EEPROM writes also require --cpo-disruptive"
-    location = json.loads(location)
-    assert set(location) == {"target", "index", "bank", "page", "offset", "data"}, location
-    target = location["target"]
-    assert target in ("oe", "els"), location
-    for key in ("index", "bank", "page", "offset"):
-        assert type(location[key]) is int and location[key] >= 0, location
-    data = bytes.fromhex(location["data"])
-    assert data and location["offset"] + len(data) <= 256, location
-    assert location["bank"] <= 255 and location["page"] <= 255, location
-    assert location["page"] == 0 or location["offset"] >= 128, location
-    selector = target + str(location["index"])
-    assert selector in resources(cpo_environment, target), location
-    dut = cpo_environment["dut"]
-    # A single DUT-side transaction keeps saved bytes out of controller logs and
-    # pytest locals, and restores them even if write/readback fails.
-    alias = None
-    if access == "interface":
-        banked = location["page"] >= 0x10 and not 0x9F <= location["page"] <= 0xAF
-        candidates = [port for port, entry in cpo_environment["mapping"].items()
-                      if entry[target]["id"].lower() == selector
-                      and (entry["oe"]["bank"] if target == "oe" and banked else 0) == location["bank"]]
-        if not candidates:
-            pytest.skip("Approved scratch range has no matching interface/bank alias")
-        alias = sorted(candidates)[0]
-    port = next(port for port, entry in cpo_environment["mapping"].items()
-                if entry[target]["id"].lower() == selector)
-    pages = eeprom_pages(cpo_environment, port, target)
-    selected = [page for page in pages if page["page"] == location["page"]]
-    assert selected, "Approved scratch page is not declared by the endpoint"
-    assert location["offset"] >= 128 or any(page["lower"] for page in selected), "Scratch lower half unavailable"
-    assert location["offset"] + len(data) <= 128 or any(not page["lower"] for page in selected), \
-        "Scratch upper half unavailable"
-    with isolated_ports(cpo_environment, affected_ports(cpo_environment, target, selector, "eeprom")):
-        result = runner_request(dut, {"scratch": location, "port": alias})
-        assert result["rc"] == 0 and result["readback"] and result["restored"], \
-            "Scratch operation failed; retained private recovery file: {}".format(result.get("recovery_file"))
+@pytest.mark.skip(reason="interface lane-status is deferred at the user's request")
+def test_cpoutil_lane_status():
+    """Reserved coverage entry; no lane-status command executes in this suite."""
