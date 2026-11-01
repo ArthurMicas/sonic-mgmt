@@ -23,8 +23,9 @@ pytestmark = [pytest.mark.topology("any"), pytest.mark.device_type("physical"),
 
 
 def numbers(value):
-    return [int(item) for item in value] if isinstance(value, (list, tuple)) else [
-        int(item.strip()) for item in str(value).split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(item.strip()) for item in str(value).split(",") if item.strip()]
 
 
 def read_port_config(duthost):
@@ -132,11 +133,14 @@ def isolated_interfaces(duthost, ports):
         assert wait_until(60, 2, 0, interfaces_have_state, duthost, ports, "down")
         yield
     finally:
+        # Attempt restoration for every shared port, even if one command fails.
         for port in ports:
             key = shlex.quote("PORT|" + port)
-            dom = "sonic-db-cli CONFIG_DB HSET {} dom_polling {}".format(
-                key, shlex.quote(config[port]["dom_polling"])) if "dom_polling" in config[port] else (
-                    "sonic-db-cli CONFIG_DB HDEL {} dom_polling".format(key))
+            if "dom_polling" in config[port]:
+                dom = "sonic-db-cli CONFIG_DB HSET {} dom_polling {}".format(
+                    key, shlex.quote(config[port]["dom_polling"]))
+            else:
+                dom = "sonic-db-cli CONFIG_DB HDEL {} dom_polling".format(key)
             mode = "startup" if baseline[port]["admin_state"] == "up" else "shutdown"
             for command in (dom, "sudo config interface {} {}".format(mode, port)):
                 try:
@@ -156,6 +160,13 @@ def test_cpoutil_map(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connec
     path = "/usr/share/sonic/device/{}/cpo.json".format(duthost.facts["platform"])
     topology = json.loads(duthost.command("cat " + shlex.quote(path), verbose=False)["stdout"])
     devices = {name.upper(): device for name, device in topology["devices"].items()}
+    # Build the declared OE-bank/ELS pairs independently of the CLI response.
+    declared_pairs = set()
+    for entry in topology["interfaces"].values():
+        links = {devices[item["device_id"].upper()]["device_type"]: item for item in entry["associated_devices"]}
+        oe_link = links["optical_engine"]
+        els_link = links["external_laser_source"]
+        declared_pairs.add((oe_link["device_id"].upper(), int(oe_link.get("bank", 0)), els_link["device_id"].upper()))
     records = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
     for port in connected_cpo_ports:
         oe, els = records[port]["oe"], records[port]["els"]
@@ -164,19 +175,17 @@ def test_cpoutil_map(duthosts, enum_rand_one_per_hwsku_frontend_hostname, connec
         assert set(oe["lanes"]) == set(numbers(ports[port]["lanes"]))
         assert type(oe["bank"]) is int and 0 <= oe["bank"] < int(devices[oe["id"]].get("max_banks", 1))
         assert set(oe["lanes"]) <= set(numbers(devices[oe["id"]]["asic_lanes"]))
-        width = len(numbers(devices[oe["id"]]["asic_lanes"])) // int(devices[oe["id"]].get("max_banks", 1))
-        bank_lanes = numbers(devices[oe["id"]]["asic_lanes"])[oe["bank"] * width:(oe["bank"] + 1) * width]
+        device_lanes = numbers(devices[oe["id"]]["asic_lanes"])
+        width = len(device_lanes) // int(devices[oe["id"]].get("max_banks", 1))
+        bank_lanes = device_lanes[oe["bank"] * width:(oe["bank"] + 1) * width]
         assert set(oe["lanes"]) <= set(bank_lanes), "Interface lanes do not belong to the declared OE bank"
-        assert any(
-            any(item["device_id"].upper() == oe["id"] and int(item.get("bank", 0)) == oe["bank"]
-                for item in entry["associated_devices"])
-            and any(item["device_id"].upper() == els["id"] for item in entry["associated_devices"])
-            for entry in topology["interfaces"].values()), "OE/ELS association does not match topology"
+        assert (oe["id"], oe["bank"], els["id"]) in declared_pairs, "OE/ELS association does not match topology"
         assert els["lasers"] is None or (isinstance(els["lasers"], list)
                                          and all(type(laser) is int and laser >= 0 for laser in els["lasers"]))
     table = run_cpoutil(duthost, "show interface map")["table"]
     assert {"Interface", "OE", "OE Lanes", "ELS", "ELS Lasers"} <= set(table["headers"])
     assert set(connected_cpo_ports) <= set(table["resources"])
+    # Validate all connected ports in bulk, then one representative selector.
     port = connected_cpo_ports[0]
     assert json.loads(run_cpoutil(duthost, "show interface map -p " + port + " --json")["stdout"]) == {
         port: records[port]}
@@ -348,6 +357,7 @@ def test_cpoutil_tx_disable(duthosts, enum_rand_one_per_hwsku_frontend_hostname,
     mapping = json.loads(run_cpoutil(duthost, "show interface map --json")["stdout"])
     affected = sorted(name for name in mapping
                       if set(numbers(config[name]["index"])) & set(numbers(config[port]["index"])))
+    # The setter acts on a physical port, including unconnected logical siblings.
     originals = {}
     for name in affected:
         result = run_cpoutil(duthost, "show interface tx-disable -p " + name + " --json", optional=True)
@@ -360,10 +370,13 @@ def test_cpoutil_tx_disable(duthosts, enum_rand_one_per_hwsku_frontend_hostname,
         try:
             result = run_cpoutil(duthost, "config interface tx-disable -p " + port + " true", expected_rc=None)
             unsupported = result["rc"] == 1 and "not implemented" in result["stderr"]
+            if not unsupported:
+                assert result["rc"] == 0, result["stderr"]
             for name in affected:
-                expected = originals[name] if unsupported else {name: {lane: True for lane in originals[name][name]}}
-                if not unsupported:
-                    assert result["rc"] == 0, result["stderr"]
+                if unsupported:
+                    expected = originals[name]
+                else:
+                    expected = {name: {lane: True for lane in originals[name][name]}}
                 wait_for_state(duthost, "show interface tx-disable -p " + name, expected)
         finally:
             if not unsupported:
@@ -393,6 +406,7 @@ def test_cpoutil_reset(duthosts, enum_rand_one_per_hwsku_frontend_hostname, conn
     if any(status[port]["admin_state"] != "up" for port in affected):
         pytest.skip("Reset recovery requires all shared ports admin-up for reprovisioning")
     before_presence = json.loads(run_cpoutil(duthost, "show interface presence --json")["stdout"])
+    # A shared endpoint can reset several interfaces; save each interface's state.
     before = {}
     for port in affected:
         before[port] = {}
